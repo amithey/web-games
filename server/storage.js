@@ -103,4 +103,28 @@ function getStorageStatus() {
   return initError;
 }
 
-module.exports = { supabase, uploadFile, deleteFolder, getMimeType, getStorageStatus };
+/**
+ * Create a signed upload URL that lets the client PUT a file directly to
+ * Supabase Storage, bypassing the serverless body size limit.
+ */
+async function createSignedUploadUrl(storagePath) {
+  if (initError) throw new Error(`Storage not configured: ${initError}`);
+  const { data, error } = await supabase.storage
+    .from(BUCKET)
+    .createSignedUploadUrl(storagePath);
+  if (error) throw new Error(`Failed to create signed upload URL: ${error.message}`);
+  const { data: pub } = supabase.storage.from(BUCKET).getPublicUrl(storagePath);
+  return {
+    path: storagePath,
+    signedUrl: data.signedUrl,
+    token: data.token,
+    publicUrl: pub.publicUrl,
+  };
+}
+
+function getPublicUrl(storagePath) {
+  const { data } = supabase.storage.from(BUCKET).getPublicUrl(storagePath);
+  return data.publicUrl;
+}
+
+module.exports = { supabase, uploadFile, deleteFolder, getMimeType, getStorageStatus, createSignedUploadUrl, getPublicUrl };

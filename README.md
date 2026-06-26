@@ -10,7 +10,7 @@ A modern community platform for uploading, sharing, and playing browser-based ga
 
 - **Game Discovery** -- Browse, search, filter by tags, and sort by popularity, rating, recency, or featured status.
 - **Seamless Playback** -- Games run in sandboxed iframes with keyboard event isolation for an uninterrupted experience.
-- **Upload** -- Upload single HTML files or ZIP archives (up to 4MB) with optional thumbnails.
+- **Upload** -- Upload single HTML files or multi-file ZIP archives (up to 200MB / 500 files) via direct-to-Supabase signed URLs, with optional thumbnails.
 - **Ratings & Likes** -- 1-5 star rating system and like/unlike toggle for every game.
 - **Comments** -- Community discussion on each game page.
 - **Creator Profiles** -- Dedicated pages per author with aggregated stats (total games, likes, plays).
@@ -150,6 +150,6 @@ Frontend: `http://localhost:5173` | Backend: `http://localhost:3001`
 
 ## Limitations
 
-- Vercel Serverless has a ~4.5MB payload limit -- game files should stay under 4MB.
+- Vercel Serverless has a ~4.5MB payload limit, so game files are uploaded **directly** to Supabase Storage via signed URLs (client unzips in-browser with JSZip). Current caps: 200MB total / 500 files per game.
 - Vercel Hobby tier has a 10s function timeout.
 - Cold starts may add 1-2s delay on first request.

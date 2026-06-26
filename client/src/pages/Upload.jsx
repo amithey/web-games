@@ -2,6 +2,22 @@ import React, { useState, useCallback, useMemo } from 'react';
 import { useNavigate, Link } from 'react-router-dom';
 import axios from 'axios';
 import { useDropzone } from 'react-dropzone';
+import { supabase } from '../supabase';
+
+// Lazy-load JSZip from CDN to keep the client bundle small and avoid extra deps.
+let _jszipPromise = null;
+function loadJSZip() {
+  if (window.JSZip) return Promise.resolve(window.JSZip);
+  if (_jszipPromise) return _jszipPromise;
+  _jszipPromise = new Promise((resolve, reject) => {
+    const s = document.createElement('script');
+    s.src = 'https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js';
+    s.onload = () => resolve(window.JSZip);
+    s.onerror = () => reject(new Error('Failed to load JSZip'));
+    document.head.appendChild(s);
+  });
+  return _jszipPromise;
+}
 import { motion, AnimatePresence } from 'framer-motion';
 import {
   Upload as UploadIcon,
@@ -153,22 +169,91 @@ export default function Upload() {
 
     setLoading(true);
     setServerError('');
-    
-    const data = new FormData();
-    Object.entries(form).forEach(([k, v]) => data.append(k, v));
-    data.append('gameFile', gameFile);
-    if (thumbnail) data.append('thumbnail', thumbnail);
+    setUploadProgress(0);
 
     try {
-      const res = await axios.post('/api/games', data, {
-        onUploadProgress: e => {
-          const pct = Math.round((e.loaded * 100) / e.total);
-          setUploadProgress(pct);
+      // ── 1. Build the file list ──────────────────────────────────────────────
+      // For .html uploads we only have a single file named "index.html".
+      // For .zip uploads we unzip in-browser so every inner file is uploaded
+      // individually straight to Supabase Storage, bypassing the serverless
+      // 4.5 MB body limit entirely.
+      const ext = gameFile.name.toLowerCase().endsWith('.zip') ? '.zip' : '.html';
+      let entries = []; // { rel, blob, size }
+
+      if (ext === '.html') {
+        entries.push({ rel: 'index.html', blob: gameFile, size: gameFile.size });
+      } else {
+        const JSZip = await loadJSZip();
+        const zip = await JSZip.loadAsync(gameFile);
+        const all = [];
+        zip.forEach((relPath, entry) => {
+          if (!entry.dir) all.push({ relPath, entry });
+        });
+        if (all.length === 0) throw new Error('ZIP file is empty');
+
+        // Find the shallowest index.html and strip its parent folder so
+        // relative asset paths resolve correctly when served.
+        const indexes = all
+          .map(x => x.relPath)
+          .filter(p => p.split('/').pop().toLowerCase() === 'index.html')
+          .sort((a, b) => a.split('/').length - b.split('/').length);
+        if (indexes.length === 0) throw new Error('ZIP must contain an index.html file');
+        const indexPath = indexes[0];
+        const lastSlash = indexPath.lastIndexOf('/');
+        const prefix = lastSlash >= 0 ? indexPath.slice(0, lastSlash + 1) : '';
+
+        for (const { relPath, entry } of all) {
+          const rel = relPath.startsWith(prefix) ? relPath.slice(prefix.length) : relPath;
+          if (!rel) continue;
+          const blob = await entry.async('blob');
+          entries.push({ rel, blob, size: blob.size });
         }
+      }
+
+      // ── 2. Ask the server for signed upload URLs ────────────────────────────
+      const signRes = await axios.post('/api/games/sign-upload', {
+        files: entries.map(e => ({ path: e.rel, size: e.size })),
+        thumbnailExt: thumbnail ? (thumbnail.name.match(/\.(png|jpe?g|webp|gif)$/i)?.[0].toLowerCase() || '.png') : null,
       });
+      const { id, files: signedFiles, thumbnail: signedThumb } = signRes.data;
+      const urlByRel = Object.fromEntries(signedFiles.map(f => [f.rel, f]));
+
+      // ── 3. Upload every file directly to Supabase Storage ───────────────────
+      const totalBytes = entries.reduce((s, e) => s + e.size, 0) + (thumbnail?.size || 0) || 1;
+      let uploaded = 0;
+      for (const e of entries) {
+        const signed = urlByRel[e.rel];
+        if (!signed) throw new Error(`Missing signed URL for ${e.rel}`);
+        const { error } = await supabase.storage
+          .from('games')
+          .uploadToSignedUrl(signed.path, signed.token, e.blob, { upsert: true });
+        if (error) throw new Error(`Upload failed for ${e.rel}: ${error.message}`);
+        uploaded += e.size;
+        setUploadProgress(Math.min(99, Math.round((uploaded / totalBytes) * 100)));
+      }
+
+      let thumbnailPath = null;
+      if (thumbnail && signedThumb) {
+        const { error } = await supabase.storage
+          .from('games')
+          .uploadToSignedUrl(signedThumb.path, signedThumb.token, thumbnail, { upsert: true });
+        if (error) throw new Error(`Thumbnail upload failed: ${error.message}`);
+        thumbnailPath = signedThumb.path.replace(/^thumbnails\//, '');
+      }
+
+      // ── 4. Finalize: create DB record ───────────────────────────────────────
+      const res = await axios.post('/api/games/direct', {
+        id,
+        ...form,
+        fileType: ext === '.zip' ? 'zip' : 'html',
+        indexPath: 'index.html',
+        thumbnailPath,
+      });
+      setUploadProgress(100);
       navigate(`/games/${res.data.id}`);
     } catch (err) {
-      setServerError(err.response?.data?.error || 'Failed to upload game. Please try again.');
+      console.error(err);
+      setServerError(err.response?.data?.error || err.message || 'Failed to upload game. Please try again.');
       setLoading(false);
     }
   };
@@ -286,10 +371,15 @@ export default function Upload() {
             </h3>
             <Dropzone 
               onDrop={onGameDrop}
-              accept={{ 'text/html': ['.html'], 'application/zip': ['.zip'] }}
+              accept={{
+                'text/html': ['.html'],
+                'application/zip': ['.zip'],
+                'application/x-zip-compressed': ['.zip'],
+                'application/octet-stream': ['.zip'],
+              }}
               icon={UploadIcon}
               label="Game File (.html, .zip)"
-              hint="Max size: 4MB"
+              hint="Single HTML or a ZIP containing index.html + assets — up to 200 MB"
               file={gameFile}
               error={errors.gameFile}
             />

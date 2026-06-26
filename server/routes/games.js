@@ -5,7 +5,7 @@ const path     = require('path');
 const AdmZip   = require('adm-zip');
 const { v4: uuidv4 } = require('uuid');
 const db       = require('../db');
-const { uploadFile, deleteFolder, getMimeType } = require('../storage');
+const { uploadFile, deleteFolder, getMimeType, createSignedUploadUrl, getPublicUrl } = require('../storage');
 const { uploadLimiter, interactionLimiter } = require('../middleware/rateLimiter');
 const { optionalAuth } = require('../middleware/auth');
 
@@ -244,6 +244,148 @@ router.post('/', uploadLimiter, optionalAuth, upload.fields([{ name: 'gameFile',
     if (id) await deleteFolder(`files/${id}`).catch(() => {});
     console.error('Error uploading game:', err);
     res.status(500).json({ error: err.message || 'Failed to upload game' });
+  }
+});
+
+// ─── POST /api/games/sign-upload — get signed URLs for direct-to-Storage upload
+// Lets the client bypass the 4.5MB serverless body limit by PUT-ing files
+// straight to Supabase Storage. Returns a freshly-minted game id and a signed
+// URL per requested path (plus an optional thumbnail signed URL).
+
+const MAX_DIRECT_UPLOAD_FILES = 500;
+const MAX_DIRECT_UPLOAD_TOTAL_BYTES = 200 * 1024 * 1024; // 200 MB total
+const ALLOWED_FILE_EXTS = new Set([
+  '.html','.htm','.css','.js','.mjs','.json','.txt','.md','.map',
+  '.png','.jpg','.jpeg','.gif','.webp','.svg','.ico','.bmp',
+  '.wav','.mp3','.ogg','.m4a','.flac',
+  '.mp4','.webm','.mov',
+  '.wasm','.data','.mem',
+  '.woff','.woff2','.ttf','.otf','.eot',
+  '.glb','.gltf','.obj','.mtl','.fbx',
+  '.xml','.csv','.atlas','.fnt',
+]);
+
+function isSafeRelPath(rel) {
+  if (!rel || typeof rel !== 'string') return false;
+  if (rel.length > 300) return false;
+  if (rel.startsWith('/') || rel.includes('..') || rel.includes('\\')) return false;
+  if (/[\0<>:"|?*]/.test(rel)) return false;
+  return true;
+}
+
+router.post('/sign-upload', uploadLimiter, optionalAuth, async (req, res) => {
+  try {
+    const { files, thumbnailExt } = req.body || {};
+    if (!Array.isArray(files) || files.length === 0) {
+      return res.status(400).json({ error: 'files array is required' });
+    }
+    if (files.length > MAX_DIRECT_UPLOAD_FILES) {
+      return res.status(400).json({ error: `Too many files (max ${MAX_DIRECT_UPLOAD_FILES})` });
+    }
+
+    // Validate + require an index.html somewhere
+    let totalBytes = 0;
+    let hasIndex = false;
+    const normalized = [];
+    for (const f of files) {
+      const rel = (f && f.path || '').trim().replace(/^\/+/, '');
+      const size = Number(f && f.size) || 0;
+      if (!isSafeRelPath(rel)) {
+        return res.status(400).json({ error: `Invalid file path: ${rel}` });
+      }
+      const ext = path.extname(rel).toLowerCase();
+      if (!ALLOWED_FILE_EXTS.has(ext)) {
+        return res.status(400).json({ error: `File type not allowed: ${rel}` });
+      }
+      if (rel.toLowerCase().split('/').pop() === 'index.html') hasIndex = true;
+      totalBytes += size;
+      normalized.push({ rel, size });
+    }
+    if (!hasIndex) {
+      return res.status(400).json({ error: 'At least one file must be named index.html' });
+    }
+    if (totalBytes > MAX_DIRECT_UPLOAD_TOTAL_BYTES) {
+      return res.status(413).json({ error: `Total size exceeds ${MAX_DIRECT_UPLOAD_TOTAL_BYTES / (1024*1024)} MB` });
+    }
+
+    const id = uuidv4();
+    const signedFiles = [];
+    for (const { rel } of normalized) {
+      const storagePath = `files/${id}/${rel}`;
+      const entry = await createSignedUploadUrl(storagePath);
+      signedFiles.push({ rel, ...entry });
+    }
+
+    let thumbnail = null;
+    if (thumbnailExt) {
+      const ext = String(thumbnailExt).toLowerCase();
+      if (!/^\.(png|jpg|jpeg|webp|gif)$/.test(ext)) {
+        return res.status(400).json({ error: 'Invalid thumbnail extension' });
+      }
+      thumbnail = await createSignedUploadUrl(`thumbnails/${id}${ext}`);
+    }
+
+    res.json({ id, files: signedFiles, thumbnail });
+  } catch (err) {
+    console.error('sign-upload error:', err);
+    res.status(500).json({ error: err.message || 'Failed to sign upload' });
+  }
+});
+
+// ─── POST /api/games/direct — finalize a direct-upload game ───────────────────
+// Called after the client has successfully PUT all files to the signed URLs.
+// Inserts the DB record pointing at the already-uploaded index.html.
+
+router.post('/direct', uploadLimiter, optionalAuth, async (req, res) => {
+  const {
+    id,
+    indexPath,
+    fileType,
+    thumbnailPath,
+  } = req.body || {};
+
+  const title       = sanitizeText(req.body.title, 100);
+  const description = sanitizeText(req.body.description, 500);
+  const author      = sanitizeText(req.body.author, 80);
+  const tags        = sanitizeText(req.body.tags, 200);
+  const aiTool      = sanitizeText(req.body.aiTool, 50);
+  const category    = sanitizeText(req.body.category, 50);
+
+  if (!title) return res.status(400).json({ error: 'Title is required' });
+  if (!id || !/^[0-9a-f-]{36}$/i.test(id)) return res.status(400).json({ error: 'Invalid id' });
+  if (!indexPath || !isSafeRelPath(indexPath)) return res.status(400).json({ error: 'Invalid indexPath' });
+  if (indexPath.toLowerCase().split('/').pop() !== 'index.html') {
+    return res.status(400).json({ error: 'indexPath must point to an index.html file' });
+  }
+
+  try {
+    const fileUrl = getPublicUrl(`files/${id}/${indexPath}`);
+    let thumbnailUrl = null;
+    if (thumbnailPath && isSafeRelPath(thumbnailPath)) {
+      thumbnailUrl = getPublicUrl(`thumbnails/${thumbnailPath}`);
+    }
+
+    const tagsArray = tags
+      ? tags.split(',').map(t => t.trim()).filter(Boolean).slice(0, 10)
+      : [];
+
+    const ft = (fileType === 'html' || fileType === 'zip') ? fileType : 'zip';
+    const userId = req.user?.userId || null;
+
+    await db.query(
+      `INSERT INTO games (id, title, description, author, tags, thumbnail, thumbnail_url, file_type, file_url, ai_tool, category, user_id)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`,
+      [id, title, description, author, JSON.stringify(tagsArray), thumbnailUrl, thumbnailUrl, ft, fileUrl, aiTool, category, userId]
+    );
+
+    const { rows: [game] } = await db.query(
+      `${GAME_SELECT} WHERE g.id = $1 GROUP BY g.id`, [id]
+    );
+    res.status(201).json(formatGame(game));
+  } catch (err) {
+    await deleteFolder(`files/${id}`).catch(() => {});
+    console.error('direct upload finalize error:', err);
+    res.status(500).json({ error: err.message || 'Failed to create game' });
   }
 });
 
